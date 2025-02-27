@@ -34,16 +34,16 @@ Point-to-point correspondences between two meshes are found by matching the spec
 Polyscope is used for visualizing the meshes and the correspondences. The following images show the results of various visualizations:
 
 ### Eigenfunctions
-![Eigenfunctions](src\images\eigen_vector_0.png)
+![Eigenfunctions](src/images/eigen_vector_0.png)
 
 ### Normals
 ![Normals](src/images/normals.png)
 
 ### Mean Curvature
-![Mean Curvature](src\images\mean_curvature_fingers_feet.png)
+![Mean Curvature](src/images/mean_curvature_fingers_feet.png)
 
 ### Spectral Smoothing
-![Spectral Smoothing](src\images\spectral_smoothing_1000.png)
+![Spectral Smoothing](src/images/spectral_smoothing_1000.png)
 
 ### Mesh Correspondences
 ![Mesh Correspondences](src/images/correspondance.png)
