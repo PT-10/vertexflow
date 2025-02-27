@@ -3,6 +3,7 @@ import polyscope as ps
 from plyfile import PlyData
 import scipy.sparse as sp
 import scipy.sparse.linalg as sla
+from collections import defaultdict
 
 class Mesh():
     def __init__(self, ply_file):
@@ -31,8 +32,8 @@ class Mesh():
                 mymesh.add_scalar_quantity("eigenvector_" + str (i), evecs [:,i], enabled = True)
 
         if mean_curvature:
-            mcur = self.compute_mean_curvature()
-            mymesh.add_scalar_quantity("Mean Curvature", mcur, enabled=True)
+            mean_curvature = self.compute_mean_curvature()
+            mymesh.add_scalar_quantity("Mean Curvature", mean_curvature, enabled=True)
 
         ps.show()
 
@@ -63,6 +64,12 @@ class Mesh():
         mcur = self.compute_mean_curvature()
         
         mymesh.add_scalar_quantity("Mean Curvature", mcur, enabled=True)
+        ps.show()
+
+
+    def visualize_mesh(self, X):
+        ps.init()
+        mymesh = ps.register_surface_mesh("my mesh", X, self.T)
         ps.show()
 
 
@@ -123,6 +130,7 @@ class Mesh():
         return areas
 
 
+    
     def compute_laplacian(self):
         """
         Construct the discrete Laplace-Beltrami operator L = A^(-1) M
@@ -141,7 +149,7 @@ class Mesh():
         """
         n = (self.X).shape[0]
 
-        # ---------------- Mass Matrix (A) ----------------
+        # ---------------- Matrix (A) ----------------
         #mass matrix is diagonal matrix of size = number of vertices = X.shape[0]
         face_areas = self.mesh_triangle_area()
 
@@ -149,59 +157,143 @@ class Mesh():
         A = np.zeros(n)
 
         #adds 1/3rd of area of triangle to indices having common x coordinate (i = 0), same for y (i = 1) and z (i = 2)
-        for i in range(3):
-            np.add.at(A, self.T[:, i], face_areas / 3.0)
+        np.add.at(A, self.T.ravel(), np.repeat(face_areas / 3.0, 3))
 
         #convert row matrix to diagonal matrix
         A = sp.diags(A)
         self.A = A
 
-        # ---------------- Stiffness Matrix (M) ----------------
-        i = self.T[:, 0]
-        j = self.T[:, 1]
-        k = self.T[:, 2]
-
-        #compute edge vectors
-        e_ij = self.X[j] - self.X[i]
-        e_ik = self.X[k] - self.X[i]
-        e_jk = self.X[k] - self.X[j]
-
-        #compute cotangents (opposite angles), avoiding division by zero
-        eps = 1e-8
-        # Compute cotangent weights (opposite angles)
-        cot_alpha = np.einsum('ij,ij->i', e_ij, -e_ik) / (np.linalg.norm(np.cross(e_ij, -e_ik), axis=1) + eps)
-        cot_beta  = np.einsum('ij,ij->i', e_jk, -e_ik) / (np.linalg.norm(np.cross(e_jk, -e_ik), axis=1) + eps)
-        cot_gamma = np.einsum('ij,ij->i', e_ij, -e_jk) / (np.linalg.norm(np.cross(e_ij, -e_jk), axis=1) + eps)
-
-
-        #create sparse stiffness matrix indices
-        row_idx = np.concatenate([i, j, i, k, j, k])
-        col_idx = np.concatenate([j, i, k, i, k, j])
-        values = np.concatenate([cot_gamma, cot_gamma, cot_beta, cot_beta, cot_alpha, cot_alpha]) * 0.5
-
-        # Compute full stiffness matrix M
-        M = sp.coo_matrix((values, (row_idx, col_idx)), shape=(n, n)).tocsc()
-
-        # Set diagonal elements: M_ii = -sum(M_ij) for each vertex i
-        M.setdiag(-np.array(M.sum(axis=1)).flatten())
-        self.M = M
+        # ---------------- Matrix (M) ----------------
+        n_vertices = self.X.shape[0]
+    
+        #defaultdict to avoid if-else for first insertion
+        edge_to_triangles = defaultdict(list)
+        
+        #edge to triangle map 
+        for i, triangle in enumerate(self.T):
+            for j in range(3):
+                v1, v2 = triangle[j], triangle[(j+1)%3]
+                edge = (min(v1, v2), max(v1, v2))
+                edge_to_triangles[edge].append(i)
+        
+        # Pre-allocate arrays for matrix construction
+        # Estimate size: each edge contributes 2 entries, plus n_vertices diagonal entries
+        est_size = 2 * len(edge_to_triangles) + n_vertices
+        rows = np.zeros(est_size, dtype=np.int32)
+        cols = np.zeros(est_size, dtype=np.int32)
+        data = np.zeros(est_size, dtype=np.float64)
+        
+        # Track diagonal sums for each vertex using a dictionary
+        diag_sums = defaultdict(float)
+        
+        # Fill non-diagonal elements
+        idx = 0
+        for edge, tris in edge_to_triangles.items():
+            i, j = edge
+            wij = 0
+            
+            # Vectorized computation for triangles sharing this edge
+            for t in tris:
+                triangle = self.T[t]
+                # Find the opposite vertex (the one that's not i or j)
+                opposite_vertex = -1
+                for k in range(3):
+                    if triangle[k] != i and triangle[k] != j:
+                        opposite_vertex = triangle[k]
+                        break
+                
+                if opposite_vertex != -1:
+                    # Get vectors for angle calculation
+                    v1 = self.X[i] - self.X[opposite_vertex]
+                    v2 = self.X[j] - self.X[opposite_vertex]
+                    
+                    # Faster cotangent calculation
+                    dot_product = np.dot(v1, v2)
+                    cross_norm = np.linalg.norm(np.cross(v1, v2))
+                    
+                    # Avoid division by zero
+                    if cross_norm > 1e-10:
+                        wij += 0.5 * (dot_product / cross_norm)
+            
+            # Add symmetric entries for the edge
+            rows[idx] = i
+            cols[idx] = j
+            data[idx] = -wij
+            idx += 1
+            
+            rows[idx] = j
+            cols[idx] = i
+            data[idx] = -wij
+            idx += 1
+            
+            # Track contributions to diagonal sums
+            diag_sums[i] += -wij
+            diag_sums[j] += -wij
+        
+        # Add diagonal elements
+        for i, sum_val in diag_sums.items():
+            rows[idx] = i
+            cols[idx] = i
+            data[idx] = -sum_val  # Negative of sum of off-diagonal elements
+            idx += 1
+        
+        # Trim arrays to actual size used
+        rows = rows[:idx]
+        cols = cols[:idx]
+        data = data[:idx]
+        
+        # Create sparse matrix
+        self.M = sp.csr_matrix((data, (rows, cols)), shape=(n_vertices, n_vertices))
 
         #compute Laplacian L = A^(-1) M 
         A_inv = sp.diags(1 / (self.A.diagonal() + 1e-8))
-        L = A_inv.dot(self.M)
+        L = A_inv @ self.M
         self.L = L
 
 
     def compute_mean_curvature(self):
-        delta_X = self.L @ self.X  # Compute Laplacian of vertex positions (N, 3)
-        mcurn = 0.5 * delta_X  # Mean curvature vector (N, 3)
+
+        if self.L is None:
+            self.compute_laplacian()
+
+        delta_X = self.L.dot(self.X)  # Compute Laplacian of vertex positions (N, 3)
+        mean_curvature_vector = delta_X
+    
+        # Mean curvature is half the magnitude of the mean curvature vector
+        mean_curvature_magnitude = np.linalg.norm(mean_curvature_vector, axis=1) * 0.5
         
-        if not self.normals:
+        if self.normals is None:
             self.normals = self.vertnormalfunc()
 
-        mcur = 0.5 * np.linalg.norm(delta_X, axis=1)  # Mean curvature (N,)
+        dot_products = np.sum(mean_curvature_vector * self.normals, axis=1)
+        signs = np.sign(dot_products)
+        
+        # Final mean curvature (signed)
+        mean_curvature = signs * mean_curvature_magnitude
+        
+        return mean_curvature
 
-        # Compute signed mean curvature
-        smcur = np.sign(np.einsum('ij,ij->i', self.normals, mcurn)) * mcur
 
-        return smcur
+    def laplacian_smoothing(self, m = 100):
+        """
+        Perform Laplacian smoothing using spectral decomposition.
+        
+        Parameters:
+        m: int, number of eigen vectors to be used for representation
+        
+        Returns:
+        numpy.ndarray: Smoothed vertex positions
+        """
+        if self.L is None:
+            self.compute_laplacian()
+        
+        evals, evecs = sla.eigsh(self.M, m, self.A, sigma = 1e-8)
+
+        # spectral coefficients are the inner product of eigen vectors with X, instead of X we have weighted X
+        a = evecs.T @ (self.A @ self.X)
+
+        # original function X can be written as sigma a_i phi_i
+        # information detail in a depends on number of eigen vectors m
+        X_smooth = evecs @ a
+
+        return X_smooth
